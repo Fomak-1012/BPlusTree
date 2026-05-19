@@ -69,6 +69,39 @@ auto BPLUSTREE_TYPE::GetValue(const KeyType& key,
      ->  bool
 {
   //Your code here
+  ReadPageGuard head_guard = bpm_ -> FetchPageRead(header_page_id_);
+
+  if (head_guard.template As<BPlusTreeHeaderPage>() -> root_page_id_ == INVALID_PAGE_ID) {
+    return false;
+  }
+
+  ReadPageGuard guard = bpm_ => FetchPageRead(head_guard.As<BPlusTreeHeaderPage>() -> root_page_id_);
+
+  head_guard.Drop();
+
+  auto tmp_page = guard.template As<BPlusTreePage>();
+
+  while (!tmp_page -> IsLeafPage()) {
+    auto internal = reinterpret_cast<const InternalPage*>(tmp_page);
+    int slot_num = BinaryFind(interal, key);
+
+    if (slot_num == -1) {
+      return false;
+    }
+
+    guard = bpm_ -> FetchPageRead(reinterpret_cast<const InternalPage*>(tmp_page) -> ValueAt(slot_num));
+    tmp_page = guard.template As<BPlusTreePage>();
+  }
+
+  auto* leaf_page = reinterpret_cast<const LeafPage*>(tmp_page);
+
+  int slot_num = BinaryFind(leaf_page, key);
+
+  if (slot_num == -1 || comparator_(leaf_page -> KeyAt(slot_num), key) != 0) {
+    return false;
+  }
+
+  result -> push_back(leaf_page -> ValueAt(slot_num));
   return true;
 }
 
@@ -89,6 +122,7 @@ auto BPLUSTREE_TYPE::Insert(const KeyType& key, const ValueType& value,
                             Transaction* txn)  ->  bool
 {
   //Your code here
+  
   return true;
 }
 
@@ -108,6 +142,7 @@ INDEX_TEMPLATE_ARGUMENTS
 void BPLUSTREE_TYPE::Remove(const KeyType& key, Transaction* txn)
 {
   //Your code here
+  
 }
 
 /*****************************************************************************
