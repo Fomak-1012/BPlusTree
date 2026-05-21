@@ -322,19 +322,19 @@ void BPLUSTREE_TYPE::Remove(const KeyType& key, Transaction* txn)
 {
   //Your code here
 
-  WritePageGuard head_guard = bpm_ -> FetchPageWrite(header_page_id_);
+  Context ctx;
+  ctx.header_page_ = bpm_ -> FetchPageWrite(header_page_id_);
+  auto& head_guard = *ctx.header_page_;
+  ctx.root_page_id_ = head_guard.template As<BPlusTreeHeaderPage>() -> root_page_id_;
 
   // empty tree
-  if (head_guard.template As<BPlusTreeHeaderPage>() -> root_page_id_ == INVALID_PAGE_ID) {
+  if (ctx.root_page_id_ == INVALID_PAGE_ID) {
     return ;
   }
 
   // easy delete
 
-  WritePageGuard guard = bpm_ -> FetchPageWrite(head_guard.As<BPlusTreeHeaderPage>() -> root_page_id_);
-
-  head_guard.Drop();
-  std::deque<WritePageGuard> fathers;
+  WritePageGuard guard = bpm_ -> FetchPageWrite(ctx.root_page_id_);
   auto tmp_page = guard.template AsMut<BPlusTreePage>();
 
   while (!tmp_page -> IsLeafPage()) {
@@ -344,14 +344,22 @@ void BPLUSTREE_TYPE::Remove(const KeyType& key, Transaction* txn)
       return ;
     }
 
-    page_id_t child_page_id = reinterpret_cast<const InternalPage*>(tmp_page) -> ValueAt(slot_num);
-    fathers.push_back(std::move(guard));
-    guard = bpm_ -> FetchPageWrite(child_page_id);
-    
+    page_id_t child_page_id = internal -> ValueAt(slot_num);
+    WritePageGuard child_guard = bpm_ -> FetchPageWrite(child_page_id);
+    auto* child_page = child_guard.template AsMut<BPlusTreePage>();
+
+    // Crab locking: if child is more than half full, deleting below
+    // won't cause it to underflow → no merge can propagate upward
+    if (child_page -> GetSize() > child_page -> GetMinSize()) {
+      ctx.write_set_.clear();
+    }
+
+    ctx.write_set_.push_back(std::move(guard));
+    guard = std::move(child_guard);
     tmp_page = guard.template AsMut<BPlusTreePage>();
   }
 
-  auto* leaf_page = reinterpret_cast<LeafPage*>(tmp_page); 
+  auto* leaf_page = reinterpret_cast<LeafPage*>(tmp_page);
   int slot_num = BinaryFind(leaf_page, key);
 
   if (slot_num == -1 || comparator_(leaf_page -> KeyAt(slot_num), key) != 0) {
@@ -381,26 +389,25 @@ void BPLUSTREE_TYPE::Remove(const KeyType& key, Transaction* txn)
    while (1){
     auto current_page = current_guard.template AsMut<BPlusTreePage>();
 
-    if (fathers.empty()) {
-      WritePageGuard header_guard = bpm_ -> FetchPageWrite(header_page_id_);
+    if (ctx.write_set_.empty()) {
       if (current_is_leaf) {
         if (current_page ->GetSize() == 0) {
-          header_guard.template AsMut<BPlusTreeHeaderPage>() -> root_page_id_ = INVALID_PAGE_ID;
+          head_guard.template AsMut<BPlusTreeHeaderPage>() -> root_page_id_ = INVALID_PAGE_ID;
         }
         return ;
       }
 
       if (current_page -> GetSize() == 0) {
-        header_guard.template AsMut<BPlusTreeHeaderPage>() ->root_page_id_ = INVALID_PAGE_ID;
+        head_guard.template AsMut<BPlusTreeHeaderPage>() ->root_page_id_ = INVALID_PAGE_ID;
       }
       else {
-        header_guard.template AsMut<BPlusTreeHeaderPage>() ->root_page_id_ = current_page_id;
+        head_guard.template AsMut<BPlusTreeHeaderPage>() ->root_page_id_ = current_page_id;
       }
       return ;
     }
 
-    auto father_guard = std::move(fathers.back());
-    fathers.pop_back();
+    auto father_guard = std::move(ctx.write_set_.back());
+    ctx.write_set_.pop_back();
     auto father = father_guard.template AsMut<BPlusTreePage>();
     auto* father_page = reinterpret_cast<InternalPage*>(father);
     int current_idx = -1;
@@ -415,13 +422,13 @@ void BPLUSTREE_TYPE::Remove(const KeyType& key, Transaction* txn)
     if (current_is_leaf) {
       auto* current_leaf = reinterpret_cast<LeafPage*>(current_page);
 
-      // have left sibling 
+      // have left sibling
 
       if (current_idx > 0) {
         page_id_t left_page_id = father_page -> ValueAt(current_idx - 1);
         auto left_guard = bpm_ -> FetchPageWrite(left_page_id);
         auto* left_page = left_guard.template AsMut<LeafPage>();
-        
+
         // left sibling has surplus elements
 
         if (left_page -> GetSize() > left_page -> GetMinSize()) {
@@ -486,8 +493,8 @@ void BPLUSTREE_TYPE::Remove(const KeyType& key, Transaction* txn)
           father_page -> SetValueAt(i, father_page -> ValueAt(i + 1));
         }
         father_page -> IncreaseSize(-1);
-      } 
-      // if don't have a left sibling, must have a right sibling 
+      }
+      // if don't have a left sibling, must have a right sibling
       // (otherwise this layer should be delete)
       else {
         page_id_t right_page_id = father_page -> ValueAt(current_idx + 1);
@@ -581,7 +588,7 @@ void BPLUSTREE_TYPE::Remove(const KeyType& key, Transaction* txn)
         father_page -> SetValueAt(i, father_page -> ValueAt(i + 1));
       }
       father_page -> IncreaseSize(-1);
-    } 
+    }
     else {
       page_id_t right_page_id = father_page -> ValueAt(current_idx + 1);
       auto right_guard = bpm_ -> FetchPageWrite(right_page_id);
