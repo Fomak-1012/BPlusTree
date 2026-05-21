@@ -130,9 +130,13 @@ auto BPLUSTREE_TYPE::Insert(const KeyType& key, const ValueType& value,
                             Transaction* txn)  ->  bool
 {
   //Your code here
-  WritePageGuard head_guard = bpm_ -> FetchPageWrite(header_page_id_);
+  Context ctx;
+  ctx.header_page_ = bpm_ -> FetchPageWrite(header_page_id_);
+  auto& head_guard = *ctx.header_page_;
+  ctx.root_page_id_ = head_guard.template As<BPlusTreeHeaderPage>() -> root_page_id_;
+
   // empty tree -> build tree
-  if (head_guard.template As<BPlusTreeHeaderPage>() -> root_page_id_ == INVALID_PAGE_ID) {
+  if (ctx.root_page_id_ == INVALID_PAGE_ID) {
     page_id_t new_page_id;
     auto new_page_guard = bpm_ -> NewPageGuarded(&new_page_id);
     auto* new_root = new_page_guard.template AsMut<LeafPage>();
@@ -144,11 +148,9 @@ auto BPLUSTREE_TYPE::Insert(const KeyType& key, const ValueType& value,
     return true;
   }
 
-  WritePageGuard guard = bpm_ -> FetchPageWrite(head_guard.As<BPlusTreeHeaderPage>() -> root_page_id_);
-  head_guard.Drop();
-
-  std::deque<WritePageGuard> fathers;
+  WritePageGuard guard = bpm_ -> FetchPageWrite(ctx.root_page_id_);
   auto tmp_page = guard.template AsMut<BPlusTreePage>();
+
   while (!tmp_page -> IsLeafPage()) {
     auto internal = reinterpret_cast<const InternalPage*>(tmp_page);
     int slot_num = BinaryFind(internal, key);
@@ -156,10 +158,18 @@ auto BPLUSTREE_TYPE::Insert(const KeyType& key, const ValueType& value,
       return false;
     }
 
-    page_id_t child_page_id = reinterpret_cast<const InternalPage*>(tmp_page) -> ValueAt(slot_num);
-    fathers.push_back(std::move(guard));
-    guard = bpm_ -> FetchPageWrite(child_page_id);
-    
+    page_id_t child_page_id = internal -> ValueAt(slot_num);
+    WritePageGuard child_guard = bpm_ -> FetchPageWrite(child_page_id);
+    auto* child_page = child_guard.template AsMut<BPlusTreePage>();
+
+    // Crab locking: if child has room, insert won't cause it to split,
+    // so no structural change can propagate upward → release all ancestors
+    if (child_page -> GetSize() < child_page -> GetMaxSize()) {
+      ctx.write_set_.clear();
+    }
+
+    ctx.write_set_.push_back(std::move(guard));
+    guard = std::move(child_guard);
     tmp_page = guard.template AsMut<BPlusTreePage>();
   }
 
@@ -215,7 +225,7 @@ auto BPLUSTREE_TYPE::Insert(const KeyType& key, const ValueType& value,
 
   // only root
 
-  if (fathers.empty()) {
+  if (ctx.write_set_.empty()) {
     page_id_t root_page_id;
     auto root_guard = bpm_ -> NewPageGuarded(&root_page_id);
     auto root_page = root_guard.template AsMut<InternalPage>();
@@ -224,16 +234,15 @@ auto BPLUSTREE_TYPE::Insert(const KeyType& key, const ValueType& value,
     root_page -> SetKeyAt(1, new_key);
     root_page -> SetValueAt(1, new_value);
     root_page -> IncreaseSize(1);
-    WritePageGuard header_guard = bpm_ -> FetchPageWrite(header_page_id_);
-    header_guard.template AsMut<BPlusTreeHeaderPage>() -> root_page_id_ = root_page_id;
+    head_guard.template AsMut<BPlusTreeHeaderPage>() -> root_page_id_ = root_page_id;
     return true;
   }
 
   // upward split
 
-  while(!fathers.empty()) {
-    auto father_guard = std::move(fathers.back());
-    fathers.pop_back();
+  while(!ctx.write_set_.empty()) {
+    auto father_guard = std::move(ctx.write_set_.back());
+    ctx.write_set_.pop_back();
     auto father = father_guard.AsMut<BPlusTreePage>();
     auto* father_page = reinterpret_cast<InternalPage*>(father);
     int father_size = father_page -> GetSize();
@@ -254,7 +263,7 @@ auto BPLUSTREE_TYPE::Insert(const KeyType& key, const ValueType& value,
     new_page_guard = bpm_ -> NewPageGuarded(&new_page_id);
     auto* back_internal_page = new_page_guard.template AsMut<InternalPage>();
     back_internal_page -> Init(father_max_size);
-    
+
     int current_father_size = father_page -> GetSize();
     front_size = current_father_size >> 1;
     back_size = current_father_size - front_size;
@@ -282,8 +291,7 @@ auto BPLUSTREE_TYPE::Insert(const KeyType& key, const ValueType& value,
   root_page -> SetKeyAt(1, new_key);
   root_page -> SetValueAt(1, new_value);
   root_page -> IncreaseSize(1);
-  WritePageGuard header_guard = bpm_ -> FetchPageWrite(header_page_id_);
-  header_guard.template AsMut<BPlusTreeHeaderPage>() -> root_page_id_ = root_page_id;
+  head_guard.template AsMut<BPlusTreeHeaderPage>() -> root_page_id_ = root_page_id;
 
   return true;
 }
