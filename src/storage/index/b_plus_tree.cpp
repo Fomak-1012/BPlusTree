@@ -527,6 +527,8 @@ void BPLUSTREE_TYPE::Remove(const KeyType& key, Transaction* txn)
       return;
     }
 
+    // Internal version
+
     if (current_idx > 0) {
       page_id_t left_page_id = father_page -> ValueAt(current_idx - 1);
       auto left_guard = bpm_ -> FetchPageWrite(left_page_id);
